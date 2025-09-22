@@ -2,14 +2,16 @@ import os
 import json
 import asyncio
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from geopy.distance import geodesic
 from aiohttp import web
 import logging
 import aiohttp
+import sqlite3
+from dataclasses import dataclass
 
 # Setup logging
 logging.basicConfig(
@@ -28,67 +30,445 @@ ARRIVAL_RADIUS_KM = float(os.getenv("ARRIVAL_RADIUS_KM", "0.1"))
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "5000"))
 ANTARES_URL_POST = os.getenv("ANTARES_URL_POST")
 ANTARES_ACCESS_KEY = os.getenv("ANTARES_ACCESS_KEY")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "child_monitoring.db")
+ADMIN_CHAT_IDS = list(map(int, os.getenv("ADMIN_CHAT_IDS", "").split(",")) if os.getenv("ADMIN_CHAT_IDS") else [])
 
-# Global variables untuk single parent
-PARENT_CHAT_ID = None
-USER_DATA = {
-    "user_near_school": False,
-    "user_arrived": False,
-    "monitoring_active": False
+@dataclass
+class ChildData:
+    child_id: str
+    child_name: str
+    parent_chat_id: int
+    device_id: str  # ID unik untuk device IoT
+    is_active: bool = True
+
+@dataclass
+class ParentMonitoringData:
+    chat_id: int
+    child_id: str
+    user_near_school: bool = False
+    user_arrived: bool = False
+    monitoring_active: bool = False
+    start_time: Optional[datetime] = None
+
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize database tables"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Tabel untuk data anak
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS children (
+                    child_id TEXT PRIMARY KEY,
+                    child_name TEXT NOT NULL,
+                    device_id TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Tabel untuk mapping parent-child
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS parent_child_mapping (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_chat_id INTEGER NOT NULL,
+                    child_id TEXT NOT NULL,
+                    role TEXT DEFAULT 'parent',
+                    phone_number TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (child_id) REFERENCES children (child_id),
+                    UNIQUE(parent_chat_id, child_id)
+                )
+            ''')
+            
+            # Tabel untuk monitoring session
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS monitoring_sessions (
+                    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_chat_id INTEGER NOT NULL,
+                    child_id TEXT NOT NULL,
+                    start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    end_time TIMESTAMP NULL,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY (child_id) REFERENCES children (child_id)
+                )
+            ''')
+            
+            conn.commit()
+            logger.info("Database initialized successfully")
+    
+    def register_child(self, child_id: str, child_name: str, device_id: str) -> bool:
+        """Register a new child"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO children (child_id, child_name, device_id) VALUES (?, ?, ?)",
+                    (child_id, child_name, device_id)
+                )
+                conn.commit()
+                logger.info(f"Child registered: {child_name} ({child_id})")
+                return True
+        except sqlite3.IntegrityError as e:
+            logger.error(f"Failed to register child: {e}")
+            return False
+    
+    def register_parent_child(self, parent_chat_id: int, child_id: str, role: str = 'parent', phone_number: str = None) -> bool:
+        """Register parent-child mapping"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO parent_child_mapping (parent_chat_id, child_id, role, phone_number) VALUES (?, ?, ?, ?)",
+                    (parent_chat_id, child_id, role, phone_number)
+                )
+                conn.commit()
+                logger.info(f"Parent {parent_chat_id} registered for child {child_id} as {role}")
+                return True
+        except sqlite3.IntegrityError as e:
+            logger.error(f"Failed to register parent-child mapping: {e}")
+            return False
+    
+    def get_children_by_parent_and_role(self, parent_chat_id: int, role: str) -> List[ChildData]:
+        """Get all children for a parent with specific role"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT c.child_id, c.child_name, pcm.parent_chat_id, c.device_id, pcm.is_active
+                FROM children c
+                JOIN parent_child_mapping pcm ON c.child_id = pcm.child_id
+                WHERE pcm.parent_chat_id = ? AND pcm.role = ? AND pcm.is_active = 1
+            ''', (parent_chat_id, role))
+            
+            results = cursor.fetchall()
+            return [ChildData(
+                child_id=row[0],
+                child_name=row[1], 
+                parent_chat_id=row[2],
+                device_id=row[3],
+                is_active=bool(row[4])
+            ) for row in results]
+        """Get all children for a parent"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT c.child_id, c.child_name, pcm.parent_chat_id, c.device_id, pcm.is_active
+                FROM children c
+                JOIN parent_child_mapping pcm ON c.child_id = pcm.child_id
+                WHERE pcm.parent_chat_id = ? AND pcm.is_active = 1
+            ''', (parent_chat_id,))
+            
+            results = cursor.fetchall()
+            return [ChildData(
+                child_id=row[0],
+                child_name=row[1], 
+                parent_chat_id=row[2],
+                device_id=row[3],
+                is_active=bool(row[4])
+            ) for row in results]
+    
+    def get_parents_by_child_and_role(self, child_id: str, role: str) -> List[int]:
+        """Get all parent chat IDs for a specific child with specific role"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT parent_chat_id 
+                FROM parent_child_mapping 
+                WHERE child_id = ? AND role = ? AND is_active = 1
+            ''', (child_id, role))
+            
+            results = cursor.fetchall()
+            return [row[0] for row in results]
+    
+    def get_user_role(self, chat_id: int) -> str:
+        """Get user role based on chat_id"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT role FROM parent_child_mapping 
+                WHERE parent_chat_id = ? AND is_active = 1
+                LIMIT 1
+            ''', (chat_id,))
+            
+            result = cursor.fetchone()
+            return result[0] if result else 'unknown'
+    
+    def is_admin(self, chat_id: int) -> bool:
+        """Check if user is admin"""
+        return chat_id in ADMIN_CHAT_IDS
+        """Get all parent chat IDs for a specific child"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT parent_chat_id 
+                FROM parent_child_mapping 
+                WHERE child_id = ? AND is_active = 1
+            ''', (child_id,))
+            
+            results = cursor.fetchall()
+            return [row[0] for row in results]
+    
+    def get_child_by_device_id(self, device_id: str) -> Optional[ChildData]:
+        """Get child data by device ID"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT child_id, child_name, device_id
+                FROM children 
+                WHERE device_id = ?
+            ''', (device_id,))
+            
+            result = cursor.fetchone()
+            if result:
+                return ChildData(
+                    child_id=result[0],
+                    child_name=result[1],
+                    parent_chat_id=0,  # Will be filled when needed
+                    device_id=result[2]
+                )
+            return None
+    
+    def start_monitoring_session(self, parent_chat_id: int, child_id: str) -> bool:
+        """Start a monitoring session"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO monitoring_sessions (parent_chat_id, child_id) VALUES (?, ?)",
+                    (parent_chat_id, child_id)
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to start monitoring session: {e}")
+            return False
+    
+    def end_monitoring_session(self, parent_chat_id: int, child_id: str) -> bool:
+        """End a monitoring session"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE monitoring_sessions 
+                    SET end_time = CURRENT_TIMESTAMP, is_active = 0
+                    WHERE parent_chat_id = ? AND child_id = ? AND is_active = 1
+                ''', (parent_chat_id, child_id))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Failed to end monitoring session: {e}")
+            return False
+
+
+
+# --- Mapping kode ↔ nama (bisa diubah sesuai kebutuhan) ---
+GURU_CODES = {
+    "teacher_1a": "Pak Andi", "teacher_1b": "Bu Siti",
+    "teacher_2a": "Pak Budi", "teacher_2b": "Bu Rina",
+    "teacher_3a": "Pak Cipto", "teacher_3b": "Bu Dewi",
+    "teacher_4a": "Pak Dedi", "teacher_4b": "Bu Lilis",
+    "teacher_5a": "Pak Eko", "teacher_5b": "Bu Sari",
+    "teacher_6a": "Pak Fajar", "teacher_6b": "Bu Tini"
+}
+ORTU_CODES = {
+    f"user{j}": f"Orang Tua {j}" for j in range(1, 16)
+}
+NINO_CODES = {
+    f"nino_{str(k).zfill(3)}": f"Anak {k}" for k in range(1, 16)
 }
 
-# Class untuk mengirim pesan ke Telegram
+# Helper untuk dapatkan nama dari kode
+def get_guru_name(kode):
+    return GURU_CODES.get(kode, kode)
+def get_ortu_name(kode):
+    return ORTU_CODES.get(kode, kode)
+def get_nino_name(kode):
+    return NINO_CODES.get(kode, kode)
+
+db_manager = DatabaseManager(DATABASE_PATH)
+MONITORING_DATA: Dict[str, ParentMonitoringData] = {}  # key: f"{parent_chat_id}_{child_id}"
+
+def get_monitoring_key(parent_chat_id: int, child_id: str) -> str:
+    """Generate unique key for monitoring data"""
+    return f"{parent_chat_id}_{child_id}"
+
+# --- Command /register_user khusus admin ---
+async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    # Cek admin
+    if not db_manager.is_admin(chat_id):
+        # Deteksi peran otomatis
+        user_role = db_manager.get_user_role(chat_id)
+        if user_role == 'teacher':
+            await update.message.reply_text(
+                "❌ Command ini hanya untuk admin.\n\n"
+                "Sebagai guru, silakan gunakan /register_guru untuk registrasi."
+            )
+        elif user_role == 'parent':
+            await update.message.reply_text(
+                "❌ Command ini hanya untuk admin.\n\n"
+                "Sebagai orang tua, silakan gunakan /register_ortu untuk registrasi."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Command ini hanya untuk admin.\n\n"
+                "Jika Anda guru, gunakan /register_guru. Jika Anda orang tua, gunakan /register_ortu."
+            )
+        return
+    if len(context.args) != 6:
+        await update.message.reply_text(
+            "Format: /register_user nino_id 'nama anak' teacher_id 'nama guru' user_id 'nama ortu'\n\n"
+            "Contoh: /register_user nino_001 'Budi' teacher_1a 'Pak Andi' user1 'Bu Sari'"
+        )
+        return
+    nino_id, nama_anak, teacher_id, nama_guru, user_id, nama_ortu = context.args
+    # Validasi kode
+    if nino_id not in NINO_CODES:
+        await update.message.reply_text(f"Kode alat tidak valid: {nino_id}")
+        return
+    if teacher_id not in GURU_CODES:
+        await update.message.reply_text(f"Kode guru tidak valid: {teacher_id}")
+        return
+    if user_id not in ORTU_CODES:
+        await update.message.reply_text(f"Kode ortu tidak valid: {user_id}")
+        return
+    # Register anak
+    child_ok = db_manager.register_child(nino_id, nama_anak, nino_id)
+    # Register guru (tanpa chat_id, mapping by kode dulu)
+    db_manager.register_parent_child(teacher_id, nino_id, 'teacher')
+    # Register ortu (tanpa chat_id, mapping by kode dulu)
+    db_manager.register_parent_child(user_id, nino_id, 'parent')
+    await update.message.reply_text(
+        f"✅ Registrasi berhasil!\n\n"
+        f"👶 Anak: {nama_anak} ({nino_id})\n"
+        f"🏫 Guru: {nama_guru} ({teacher_id})\n"
+        f"👨‍👩‍👧‍👦 Ortu: {nama_ortu} ({user_id})"
+    )
+
+# --- Command /register_guru dan /register_ortu untuk registrasi mandiri ---
+GURU_CHOOSE, GURU_CONFIRM = range(2)
+ORTU_CHOOSE, ORTU_CONFIRM = range(2)
+
+async def register_guru(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Tampilkan list kode guru
+    text = "Pilih kode guru Anda (balas dengan angka 1-12):\n"
+    for idx, (kode, nama) in enumerate(GURU_CODES.items(), 1):
+        text += f"{idx}. {nama} ({kode})\n"
+    await update.message.reply_text(text)
+    context.user_data['guru_kode_list'] = list(GURU_CODES.keys())
+    return GURU_CHOOSE
+
+async def guru_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        idx = int(update.message.text.strip()) - 1
+        kode = context.user_data['guru_kode_list'][idx]
+    except (ValueError, IndexError):
+        await update.message.reply_text("Input tidak valid. Balas dengan angka 1-12.")
+        return GURU_CHOOSE
+    chat_id = update.message.chat_id
+    # Mapping chat_id ke kode guru
+    db_manager.register_parent_child(chat_id, None, 'teacher')  # None untuk child_id, hanya mapping role
+    context.user_data['guru_kode'] = kode
+    await update.message.reply_text(f"Anda terdaftar sebagai {GURU_CODES[kode]} ({kode})")
+    # Tampilkan anak yang terdaftar dengan guru ini (dummy, bisa diupdate sesuai DB)
+    anak_list = []
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT child_id, child_name FROM parent_child_mapping pcm JOIN children c ON pcm.child_id = c.child_id WHERE pcm.parent_chat_id = ? AND pcm.role = 'teacher'", (kode,))
+        anak_list = cursor.fetchall()
+    if anak_list:
+        msg = "Daftar anak yang diampu:\n" + "\n".join([f"- {nama} ({cid})" for cid, nama in anak_list])
+    else:
+        msg = "Belum ada anak yang terdaftar di bawah Anda."
+    await update.message.reply_text(msg)
+    return ConversationHandler.END
+
+async def register_ortu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Tampilkan list kode ortu
+    text = "Pilih kode orang tua Anda (balas dengan angka 1-15):\n"
+    for idx, (kode, nama) in enumerate(ORTU_CODES.items(), 1):
+        text += f"{idx}. {nama} ({kode})\n"
+    await update.message.reply_text(text)
+    context.user_data['ortu_kode_list'] = list(ORTU_CODES.keys())
+    return ORTU_CHOOSE
+
+async def ortu_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        idx = int(update.message.text.strip()) - 1
+        kode = context.user_data['ortu_kode_list'][idx]
+    except (ValueError, IndexError):
+        await update.message.reply_text("Input tidak valid. Balas dengan angka 1-15.")
+        return ORTU_CHOOSE
+    chat_id = update.message.chat_id
+    db_manager.register_parent_child(chat_id, None, 'parent')  # None untuk child_id, hanya mapping role
+    context.user_data['ortu_kode'] = kode
+    await update.message.reply_text(f"Anda terdaftar sebagai {ORTU_CODES[kode]} ({kode})")
+    # Tampilkan anak yang terdaftar dengan ortu ini (dummy, bisa diupdate sesuai DB)
+    anak_list = []
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT child_id, child_name FROM parent_child_mapping pcm JOIN children c ON pcm.child_id = c.child_id WHERE pcm.parent_chat_id = ? AND pcm.role = 'parent'", (kode,))
+        anak_list = cursor.fetchall()
+    if anak_list:
+        msg = "Daftar anak Anda:\n" + "\n".join([f"- {nama} ({cid})" for cid, nama in anak_list])
+    else:
+        msg = "Belum ada anak yang terdaftar di bawah Anda."
+    await update.message.reply_text(msg)
+    return ConversationHandler.END
+
 class TelegramMessageSender:
     def __init__(self, bot_app: Application):
         self.bot = bot_app.bot
     
-    # Alert ketika anak terjatuh
-    async def send_fall_alert(self, chat_id: int):
+    async def send_fall_alert(self, chat_ids: List[int], child_name: str):
+        """Send fall alert to multiple parents"""
         timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         
         message = (
             "🚨 **ALERT DARURAT** 🚨\n\n"
-            "⚠️ ANAK ANDA TERJATUH!\n"
+            f"⚠️ {child_name.upper()} TERJATUH!\n"
             f"🕐 Waktu: {timestamp}\n"
             "📍 Segera cek lokasi anak dan hubungi sekolah!\n\n"
             "🚨 Mohon segera ambil tindakan!"
         )
         
-        try:
-            await self.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
-            logger.info(f"Fall alert sent to {chat_id} at {timestamp}")
-        except Exception as e:
-            logger.error(f"Failed to send fall alert: {e}")
+        for chat_id in chat_ids:
+            try:
+                await self.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                logger.info(f"Fall alert sent to {chat_id} for {child_name} at {timestamp}")
+            except Exception as e:
+                logger.error(f"Failed to send fall alert to {chat_id}: {e}")
     
-    # Kirim pesan ketika orang tua sudah dekat sekolah
-    async def send_location_near_school(self, chat_id: int, distance: float):
-        message = f"✅ Anda sudah berada dekat dengan sekolah\n📏 Jarak: {distance:.2f} km"
+    async def send_location_near_school(self, chat_id: int, child_name: str, distance: float):
+        message = f"✅ Anda sudah berada dekat dengan sekolah untuk menjemput {child_name}\n📏 Jarak: {distance:.2f} km"
         
         try:
             await self.bot.send_message(chat_id=chat_id, text=message)
-            logger.info(f"Near school notification sent to {chat_id}")
+            logger.info(f"Near school notification sent to {chat_id} for {child_name}")
         except Exception as e:
-            logger.error(f"Failed to send location update: {e}")
+            logger.error(f"Failed to send location update to {chat_id}: {e}")
     
-    # Kirim pesan apakah anak sudah dijemput
-    async def send_pickup_prompt(self, chat_id: int):
+    async def send_pickup_prompt(self, chat_id: int, child_name: str):
         keyboard = [["Ya", "Tidak"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
         
         try:
             await self.bot.send_message(
                 chat_id=chat_id, 
-                text="🚸 Apakah Anda sudah menjemput anak Anda?", 
+                text=f"🚸 Apakah Anda sudah menjemput {child_name}?", 
                 reply_markup=reply_markup
             )
-            logger.info(f"Pickup prompt sent to {chat_id}")
+            logger.info(f"Pickup prompt sent to {chat_id} for {child_name}")
         except Exception as e:
-            logger.error(f"Failed to send pickup prompt: {e}")
+            logger.error(f"Failed to send pickup prompt to {chat_id}: {e}")
     
-    # Kirim pesan ketika monitoring dihentikan
-    async def send_monitoring_stopped(self, chat_id: int):
+    async def send_monitoring_stopped(self, chat_id: int, child_name: str):
         message = (
-            "🔕 Monitoring dihentikan.\n\n"
+            f"🔕 Monitoring untuk {child_name} dihentikan.\n\n"
             "🛡️ Hati-hati di jalan dan semoga sampai tujuan dengan selamat!\n\n"
             "💡 Jangan lupa untuk mengetik /start lagi di esok hari agar "
             "bot ChildMonitoring berjalan kembali."
@@ -100,28 +480,27 @@ class TelegramMessageSender:
                 text=message, 
                 reply_markup=ReplyKeyboardRemove()
             )
-            logger.info(f"Monitoring stopped message sent to {chat_id}")
+            logger.info(f"Monitoring stopped message sent to {chat_id} for {child_name}")
         except Exception as e:
-            logger.error(f"Failed to send monitoring stopped message: {e}")
+            logger.error(f"Failed to send monitoring stopped message to {chat_id}: {e}")
     
-    # Kirim pesan ketika monitoring dilanjutkan
-    async def send_monitoring_continued(self, chat_id: int):
+    async def send_monitoring_continued(self, chat_id: int, child_name: str):
         keyboard = [["Ya", "Tidak"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
         
         try:
             await self.bot.send_message(
                 chat_id=chat_id,
-                text="🔔 Monitoring dilanjutkan!\n\n🚸 Apakah Anda sudah menjemput anak Anda?",
+                text=f"🔔 Monitoring untuk {child_name} dilanjutkan!\n\n🚸 Apakah Anda sudah menjemput {child_name}?",
                 reply_markup=reply_markup
             )
-            logger.info(f"Monitoring continued message sent to {chat_id}")
+            logger.info(f"Monitoring continued message sent to {chat_id} for {child_name}")
         except Exception as e:
-            logger.error(f"Failed to send monitoring continued message: {e}")
+            logger.error(f"Failed to send monitoring continued message to {chat_id}: {e}")
     
-    # Kirim data ke Antares ketika ortu sudah dekat
-    async def send_to_antares(self, data: dict):
-        url = f"{ANTARES_URL_POST}" 
+    async def send_to_antares(self, device_id: str):
+        """Send data to Antares for specific device"""
+        url = f"{ANTARES_URL_POST}/{device_id}" 
         
         payload = {
             "m2m:cin": {
@@ -137,252 +516,547 @@ class TelegramMessageSender:
             "Accept": "application/json"
         }
 
-        logger.info(f"Sending to URL: {url}")
-        logger.info(f"Headers: {headers}")
+        logger.info(f"Sending to URL: {url} for device {device_id}")
         logger.info(f"Payload: {json.dumps(payload, indent=2)}")
         
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 201:
-                        logger.info("Data berhasil dikirim ke Antares")
+                        logger.info(f"Data berhasil dikirim ke Antares untuk device {device_id}")
                     else:
-                        logger.error(f"Gagal kirim ke Antares: {response.status}")
+                        logger.error(f"Gagal kirim ke Antares untuk device {device_id}: {response.status}")
         except Exception as e:
-            logger.error(f"Error kirim ke Antares: {e}")
+            logger.error(f"Error kirim ke Antares untuk device {device_id}: {e}")
 
-
-# Handler untuk command /start
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PARENT_CHAT_ID, USER_DATA
+    """Start command - different behavior for parent vs teacher"""
+    chat_id = update.message.chat_id
+    user_role = db_manager.get_user_role(chat_id)
     
-    PARENT_CHAT_ID = update.message.chat_id
-    USER_DATA = {
-        "user_near_school": False,
-        "user_arrived": False,
-        "monitoring_active": True,
-        "start_time": datetime.now()
-    }
-    
-    context.user_data.clear()
-    
-    tutorial = (
-        "🤖 **Child Monitoring Bot Aktif!**\n\n"
-        "📍 **Untuk menyalakan Live Location:**\n"
-        "1. Tekan ikon 📎 (attachment) di kolom chat.\n"
-        "2. Pilih 'Lokasi'.\n"
-        "3. Pilih 'Bagikan lokasi terkini' (Live Location).\n"
-        "4. Pilih durasi (15 menit, 1 jam, atau 8 jam).\n\n"
-        "✅ Bot akan memantau posisi Anda sampai sekolah\n"
-        "🚨 Bot akan mengirim alert jika anak terjatuh\n\n"
-        "Ketik /status untuk melihat status monitoring"
-    )
-    
-    await update.message.reply_text(tutorial, parse_mode='Markdown')
-    logger.info(f"Monitoring started for user {PARENT_CHAT_ID}")
-
-
-# Handler untuk command /status
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global USER_DATA
-    
-    if USER_DATA.get("monitoring_active", False):
-        start_time = USER_DATA.get('start_time', datetime.now()).strftime("%H:%M:%S")
-        near_school = "✅ Ya" if USER_DATA.get('user_near_school', False) else "❌ Tidak"
-        arrived = "✅ Ya" if USER_DATA.get('user_arrived', False) else "❌ Tidak"
+    if user_role == 'parent':
+        # Parent logic - location monitoring
+        children = db_manager.get_children_by_parent_and_role(chat_id, 'parent')
         
-        status_msg = (
-            f"📊 **Status Monitoring**\n\n"
-            f"🕐 Dimulai: {start_time}\n"
-            f"📍 Dekat sekolah: {near_school}\n"
-            f"🚗 Sudah tiba: {arrived}\n"
-            f"🤖 Status: Aktif"
+        if not children:
+            await update.message.reply_text(
+                "❌ Anda belum terdaftar sebagai orangtua.\n\n"
+                "📞 Hubungi admin untuk registrasi anak Anda."
+            )
+            return
+        
+        # Start monitoring for all children
+        for child in children:
+            monitoring_key = get_monitoring_key(chat_id, child.child_id)
+            MONITORING_DATA[monitoring_key] = ParentMonitoringData(
+                chat_id=chat_id,
+                child_id=child.child_id,
+                monitoring_active=True,
+                start_time=datetime.now()
+            )
+            db_manager.start_monitoring_session(chat_id, child.child_id)
+        
+        child_names = ", ".join([child.child_name for child in children])
+        
+        tutorial = (
+            f"👨‍👩‍👧‍👦 **Mode Orangtua Aktif**\n"
+            f"Monitoring untuk: **{child_names}**\n\n"
+            "📍 **Untuk menjemput anak:**\n"
+            "1. Bagikan Live Location saat menuju sekolah\n"
+            "2. Bot akan memberi tahu ketika Anda dekat sekolah\n"
+            "3. Bot akan tanya apakah anak sudah dijemput\n\n"
+            "📋 Ketik /status untuk cek status monitoring"
         )
+        
+        await update.message.reply_text(tutorial, parse_mode='Markdown')
+        logger.info(f"Parent monitoring started for {chat_id} with {len(children)} children")
+    
+    elif user_role == 'teacher':
+        # Teacher logic - only receive fall alerts
+        children = db_manager.get_children_by_parent_and_role(chat_id, 'teacher')
+        
+        if not children:
+            await update.message.reply_text(
+                "❌ Anda belum terdaftar sebagai guru.\n\n" 
+                "📞 Hubungi admin untuk registrasi."
+            )
+            return
+        
+        child_names = ", ".join([child.child_name for child in children])
+        
+        message = (
+            f"🏫 **Mode Guru Aktif**\n"
+            f"Monitoring untuk: **{child_names}**\n\n"
+            "🚨 Anda akan menerima alert jika ada anak yang terjatuh\n"
+            "📱 Alert akan dikirim otomatis dari sistem IoT\n\n"
+            "ℹ️ Mode guru hanya menerima alert, tidak ada fitur lain."
+        )
+        
+        await update.message.reply_text(message, parse_mode='Markdown')
+        logger.info(f"Teacher alert mode activated for {chat_id} with {len(children)} children")
+    
     else:
-        status_msg = "❌ Monitoring tidak aktif. Ketik /start untuk memulai."
-    
-    await update.message.reply_text(status_msg, parse_mode='Markdown')
+        # Unknown user
+        await update.message.reply_text(
+            "❌ Anda belum terdaftar dalam sistem.\n\n"
+            "📞 Hubungi admin untuk registrasi sebagai orangtua atau guru."
+        )
 
-# Handler untuk lokasi yang dikirim user
-async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PARENT_CHAT_ID, USER_DATA
+async def register_as_parent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Register current user as parent for a child - used by parents"""
+    chat_id = update.message.chat_id
     
+    if len(context.args) != 3:
+        await update.message.reply_text(
+            "Format: `/register_as_parent [child_id] [nama_anak] [device_id]`\n\n"
+            "Contoh: `/register_as_parent ANAK001 \"Budi Santoso\" DEV001`\n\n"
+            "ℹ️ Command ini untuk orangtua mendaftarkan diri untuk anak mereka."
+        )
+        return
+    
+    child_id, child_name, device_id = context.args
+    phone = update.message.from_user.phone_number if update.message.from_user else None
+    
+    # Register child if not exists
+    if not db_manager.register_child(child_id, child_name, device_id):
+        # Child might already exist, that's ok
+        pass
+    
+    # Register as parent
+    if db_manager.register_parent_child(chat_id, child_id, 'parent', phone):
+        await update.message.reply_text(
+            f"✅ **Registrasi Berhasil!**\n\n"
+            f"👶 Anak: {child_name} ({child_id})\n"
+            f"📱 Device: {device_id}\n"
+            f"👨‍👩‍👧‍👦 Role: Orangtua\n\n"
+            f"🚀 Ketik /start untuk mulai monitoring!"
+        )
+        logger.info(f"Parent {chat_id} registered for child {child_id}")
+    else:
+        await update.message.reply_text("❌ Registrasi gagal. Mungkin Anda sudah terdaftar untuk anak ini.")
+
+async def register_as_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Register current user as teacher for a child - used by teachers"""
+    chat_id = update.message.chat_id
+    
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Format: `/register_as_teacher [child_id]`\n\n"
+            "Contoh: `/register_as_teacher ANAK001`\n\n"
+            "ℹ️ Command ini untuk guru mendaftarkan diri untuk murid mereka.\n"
+            "⚠️ Pastikan child_id sudah terdaftar oleh orangtua terlebih dahulu."
+        )
+        return
+    
+    child_id = context.args[0]
+    phone = update.message.from_user.phone_number if update.message.from_user else None
+    
+    # Check if child exists
+    child_data = db_manager.get_child_by_device_id(f"DEV{child_id[-3:]}")  # Assuming device_id pattern
+    if not child_data:
+        # Let's check by child_id directly
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT child_name FROM children WHERE child_id = ?", (child_id,))
+            result = cursor.fetchone()
+            
+            if not result:
+                await update.message.reply_text(
+                    f"❌ Child ID {child_id} tidak ditemukan.\n"
+                    "Pastikan orangtua sudah registrasi terlebih dahulu."
+                )
+                return
+    
+    # Register as teacher
+    if db_manager.register_parent_child(chat_id, child_id, 'teacher', phone):
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT child_name FROM children WHERE child_id = ?", (child_id,))
+            child_name = cursor.fetchone()[0]
+        
+        await update.message.reply_text(
+            f"✅ **Registrasi Guru Berhasil!**\n\n"
+            f"👶 Murid: {child_name} ({child_id})\n"
+            f"🏫 Role: Guru\n\n"
+            f"🚨 Anda akan menerima alert jika {child_name} terjatuh.\n"
+            f"🚀 Ketik /start untuk aktivasi mode guru!"
+        )
+        logger.info(f"Teacher {chat_id} registered for child {child_id}")
+    else:
+        await update.message.reply_text("❌ Registrasi gagal. Mungkin Anda sudah terdaftar untuk murid ini.")
+
+async def admin_register_child(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to register child with parent and teacher - admin only"""
+    chat_id = update.message.chat_id
+    
+    if not db_manager.is_admin(chat_id):
+        await update.message.reply_text("❌ Command ini hanya untuk admin.")
+        return
+    
+    if len(context.args) != 5:
+        await update.message.reply_text(
+            "Format Admin: `/admin_register [child_id] [nama_anak] [device_id] [parent_chat_id] [teacher_chat_id]`\n\n"
+            "Contoh: `/admin_register ANAK001 \"Budi\" DEV001 123456789 987654321`\n\n"
+            "ℹ️ Command ini untuk admin registrasi lengkap anak + parent + teacher."
+        )
+        return
+    
+    child_id, child_name, device_id, parent_chat_id, teacher_chat_id = context.args
+    
+    try:
+        parent_chat_id = int(parent_chat_id)
+        teacher_chat_id = int(teacher_chat_id)
+    except ValueError:
+        await update.message.reply_text("❌ Chat ID harus berupa angka.")
+        return
+    
+    # Register child
+    if db_manager.register_child(child_id, child_name, device_id):
+        # Register parent
+        parent_success = db_manager.register_parent_child(parent_chat_id, child_id, 'parent')
+        # Register teacher  
+        teacher_success = db_manager.register_parent_child(teacher_chat_id, child_id, 'teacher')
+        
+        status_msg = f"✅ **Admin Registrasi:**\n\n"
+        status_msg += f"👶 Anak: {child_name} ({child_id})\n"
+        status_msg += f"📱 Device: {device_id}\n"
+        status_msg += f"👨‍👩‍👧‍👦 Parent: {'✅' if parent_success else '❌'} {parent_chat_id}\n"
+        status_msg += f"🏫 Teacher: {'✅' if teacher_success else '❌'} {teacher_chat_id}\n\n"
+        
+        if parent_success and teacher_success:
+            status_msg += "🎉 Semua registrasi berhasil!"
+        else:
+            status_msg += "⚠️ Beberapa registrasi gagal (mungkin sudah ada)."
+        
+        await update.message.reply_text(status_msg)
+    else:
+        await update.message.reply_text("❌ Gagal registrasi anak. Mungkin child_id sudah digunakan.")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show monitoring status"""
+    chat_id = update.message.chat_id
+    user_role = db_manager.get_user_role(chat_id)
+    
+    if user_role == 'parent':
+        children = db_manager.get_children_by_parent_and_role(chat_id, 'parent')
+        
+        if not children:
+            await update.message.reply_text("❌ Tidak ada anak yang terdaftar.")
+            return
+        
+        status_messages = []
+        
+        for child in children:
+            monitoring_key = get_monitoring_key(chat_id, child.child_id)
+            monitoring_data = MONITORING_DATA.get(monitoring_key)
+            
+            if monitoring_data and monitoring_data.monitoring_active:
+                start_time = monitoring_data.start_time.strftime("%H:%M:%S") if monitoring_data.start_time else "N/A"
+                near_school = "✅ Ya" if monitoring_data.user_near_school else "❌ Tidak"
+                arrived = "✅ Ya" if monitoring_data.user_arrived else "❌ Tidak"
+                status = "🟢 Aktif"
+            else:
+                start_time = "N/A"
+                near_school = "❌ Tidak"
+                arrived = "❌ Tidak"
+                status = "🔴 Tidak Aktif"
+            
+            status_messages.append(
+                f"👶 **{child.child_name}** ({child.child_id})\n"
+                f"🕐 Dimulai: {start_time}\n"
+                f"📍 Dekat sekolah: {near_school}\n"
+                f"🚗 Sudah tiba: {arrived}\n"
+                f"🤖 Status: {status}\n"
+            )
+        
+        final_message = "📊 **Status Monitoring Orangtua**\n\n" + "\n".join(status_messages)
+        await update.message.reply_text(final_message, parse_mode='Markdown')
+    
+    elif user_role == 'teacher':
+        children = db_manager.get_children_by_parent_and_role(chat_id, 'teacher')
+        
+        if not children:
+            await update.message.reply_text("❌ Tidak ada murid yang terdaftar.")
+            return
+        
+        child_names = ", ".join([child.child_name for child in children])
+        message = (
+            f"📊 **Status Guru**\n\n"
+            f"🏫 Mode: Alert Receiver\n"
+            f"👶 Murid: {child_names}\n"
+            f"🚨 Status: Siap menerima alert jatuh\n"
+            f"📱 Total murid: {len(children)}"
+        )
+        await update.message.reply_text(message, parse_mode='Markdown')
+    
+    else:
+        await update.message.reply_text("❌ Anda belum terdaftar dalam sistem.")
+
+async def children_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show list of registered children"""
+    chat_id = update.message.chat_id
+    user_role = db_manager.get_user_role(chat_id)
+    
+    if user_role == 'unknown':
+        await update.message.reply_text("❌ Anda belum terdaftar dalam sistem.")
+        return
+    
+    children = db_manager.get_children_by_parent_and_role(chat_id, user_role)
+    
+    if not children:
+        role_name = "anak" if user_role == 'parent' else "murid"
+        await update.message.reply_text(f"❌ Tidak ada {role_name} yang terdaftar.")
+        return
+    
+    child_list = []
+    for i, child in enumerate(children, 1):
+        child_list.append(f"{i}. **{child.child_name}**\n   ID: `{child.child_id}`\n   Device: `{child.device_id}`")
+    
+    role_name = "Anak" if user_role == 'parent' else "Murid"
+    message = f"👶 **Daftar {role_name} Terdaftar:**\n\n" + "\n\n".join(child_list)
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+# Keep the old register_child for backward compatibility, but mark as admin only
+async def register_child(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Legacy admin register child command"""
+    await admin_register_child(update, context)
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle location updates from parents - ONLY FOR PARENTS"""
     if not update.message or not update.message.location:
         return
     
-    if not USER_DATA.get("monitoring_active", False):
+    chat_id = update.message.chat_id
+    user_role = db_manager.get_user_role(chat_id)
+    
+    # HANYA PARENT YANG BOLEH KIRIM LOKASI
+    if user_role != 'parent':
+        await update.message.reply_text("⚠️ Fitur lokasi hanya untuk orangtua.")
         return
     
     user_location = (update.message.location.latitude, update.message.location.longitude)
     distance = geodesic(user_location, SCHOOL_COORDS).km
     
+    # Get all children for this parent
+    children = db_manager.get_children_by_parent_and_role(chat_id, 'parent')
     message_sender = TelegramMessageSender(context.application)
     
-    # Cek apakah sudah dekat sekolah (dalam radius 1km)
-    if distance <= RADIUS_KM:
-        if not USER_DATA["user_near_school"]:
-            await message_sender.send_location_near_school(PARENT_CHAT_ID, distance)
-
-            # Mengirim data ke Antares
-            await message_sender.send_to_antares({"posisi_ortu_dekat": "ya"})
-            USER_DATA["user_near_school"] = True
+    for child in children:
+        monitoring_key = get_monitoring_key(chat_id, child.child_id)
+        monitoring_data = MONITORING_DATA.get(monitoring_key)
         
-        # Cek apakah sudah sampai di sekolah (dalam radius 0.1km)
-        if distance <= ARRIVAL_RADIUS_KM and not USER_DATA["user_arrived"]:
-            await message_sender.send_pickup_prompt(PARENT_CHAT_ID)
-            USER_DATA["user_arrived"] = True
-    else:
-        USER_DATA["user_near_school"] = False
+        if not monitoring_data or not monitoring_data.monitoring_active:
+            continue
+        
+        # Check if near school (within radius)
+        if distance <= RADIUS_KM:
+            if not monitoring_data.user_near_school:
+                await message_sender.send_location_near_school(chat_id, child.child_name, distance)
+                await message_sender.send_to_antares(child.device_id)
+                monitoring_data.user_near_school = True
+            
+            # Check if arrived at school (within arrival radius)
+            if distance <= ARRIVAL_RADIUS_KM and not monitoring_data.user_arrived:
+                await message_sender.send_pickup_prompt(chat_id, child.child_name)
+                monitoring_data.user_arrived = True
+        else:
+            monitoring_data.user_near_school = False
 
-
-# Handler untuk respons pengguna apakah anak sudah dijemput (Ya/Tidak)
 async def handle_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global PARENT_CHAT_ID, USER_DATA
-    
+    """Handle yes/no responses from parents - ONLY FOR PARENTS"""
+    chat_id = update.message.chat_id
     text = update.message.text.lower()
+    user_role = db_manager.get_user_role(chat_id)
+    
+    # HANYA PARENT YANG BISA RESPOND
+    if user_role != 'parent':
+        return
+    
+    children = db_manager.get_children_by_parent_and_role(chat_id, 'parent')
     message_sender = TelegramMessageSender(context.application)
     
     if text == "ya":
-        await message_sender.send_monitoring_stopped(PARENT_CHAT_ID)
-        USER_DATA["user_arrived"] = False
-        USER_DATA["monitoring_active"] = False
+        # Stop monitoring for all children
+        for child in children:
+            monitoring_key = get_monitoring_key(chat_id, child.child_id)
+            if monitoring_key in MONITORING_DATA:
+                MONITORING_DATA[monitoring_key].monitoring_active = False
+                MONITORING_DATA[monitoring_key].user_arrived = False
+                db_manager.end_monitoring_session(chat_id, child.child_id)
+            
+            await message_sender.send_monitoring_stopped(chat_id, child.child_name)
         
-        logger.info(f"User {PARENT_CHAT_ID} completed pickup")
+        logger.info(f"Parent {chat_id} completed pickup for all children")
     
     elif text == "tidak":
-        await message_sender.send_monitoring_continued(PARENT_CHAT_ID)
+        # Continue monitoring
+        for child in children:
+            await message_sender.send_monitoring_continued(chat_id, child.child_name)
 
-
-# Webhook handler untuk data dari Antares (deteksi jatuh)
+# Webhook handler for Antares data (fall detection)
 async def handle_antares_webhook(request):
-    global PARENT_CHAT_ID, USER_DATA
-    
+    """Handle incoming data from Antares IoT platform"""
     try:
         data = await request.json()
         logger.info(f"📡 Data dari Antares: {json.dumps(data, indent=2)}")
         
-        # Cek apakah monitoring aktif dan ada parent yang terdaftar
-        if not PARENT_CHAT_ID:
-            logger.warning("No parent registered yet - waiting for /start command")
-            return web.json_response({"status": "no_parent_registered", "message": "Please send /start to bot first"})
-        
-        if not USER_DATA.get("monitoring_active", False):
-            logger.warning("Monitoring not active - parent needs to send /start")
-            return web.json_response({"status": "monitoring_inactive", "message": "Please send /start to activate monitoring"})
-        
-        # Ambil bot application dari web app
         bot_app: Application = request.app["bot_app"]
         message_sender = TelegramMessageSender(bot_app)
         
+        device_id = None
         kondisi = None
         
-        # Handle format m2m:sgn (subscription/notification)
+        # Extract device_id from request path or data
+        path_parts = request.path.split('/')
+        if len(path_parts) >= 3:  # /monitor/device_id
+            device_id = path_parts[2]
+        
+        # Parse data for condition
         if "m2m:sgn" in data:
             sgn_data = data["m2m:sgn"]
-            logger.info(f"Received m2m:sgn notification: {sgn_data}")
-            
-            # Jika ini hanya notifikasi subscription, return OK
             if sgn_data.get("m2m:vrq") is True:
-                logger.info("Subscription verification received")
                 return web.json_response({"status": "subscription_verified"})
             
-            # Handle m2m:nev (notification event) dengan m2m:cin di dalamnya
             if "m2m:nev" in sgn_data and "m2m:rep" in sgn_data["m2m:nev"]:
                 cin_data = sgn_data["m2m:nev"]["m2m:rep"].get("m2m:cin")
                 if cin_data and "con" in cin_data:
                     try:
                         content = json.loads(cin_data["con"])
                         kondisi = content.get("kondisi")
-                        logger.info(f"Parsed kondisi from m2m:nev: {kondisi}")
+                        if not device_id:
+                            device_id = content.get("device_id")
                     except json.JSONDecodeError:
                         logger.error("Failed to parse content from m2m:nev")
         
-        # Handle format m2m:cin (content instance) 
         elif "m2m:cin" in data:
             try:
                 content = json.loads(data["m2m:cin"]["con"])
                 kondisi = content.get("kondisi")
-                logger.info(f"Parsed kondisi from m2m:cin: {kondisi}")
+                if not device_id:
+                    device_id = content.get("device_id")
             except json.JSONDecodeError:
                 logger.error("Failed to parse Antares content")
                 return web.json_response({"status": "invalid_json"})
         
-        # Handle direct format
         elif "kondisi" in data:
             kondisi = data.get("kondisi")
-            logger.info(f"Direct kondisi received: {kondisi}")
+            if not device_id:
+                device_id = data.get("device_id")
         
-        else:
-            logger.warning(f"Unknown data format from Antares: {list(data.keys())}")
-            return web.json_response({"status": "unknown_format", "received_keys": list(data.keys())})
+        # If no device_id found, try to extract from headers or query params
+        if not device_id:
+            device_id = request.headers.get('X-Device-ID') or request.query.get('device_id')
         
-        # Handle jika kondisi adalah "terjatuh"
+        if not device_id:
+            logger.warning("No device_id found in request")
+            return web.json_response({"status": "no_device_id"})
+        
         if kondisi == "terjatuh":
-            await message_sender.send_fall_alert(PARENT_CHAT_ID)
-            logger.info(f"Fall alert sent to parent {PARENT_CHAT_ID}")
-            return web.json_response({"status": "alert_sent", "condition": kondisi})
+            # Find child by device_id
+            child_data = db_manager.get_child_by_device_id(device_id)
+            if child_data:
+                # Get ONLY TEACHERS for this child
+                teacher_chat_ids = db_manager.get_parents_by_child_and_role(child_data.child_id, 'teacher')
+                if teacher_chat_ids:
+                    await message_sender.send_fall_alert(teacher_chat_ids, child_data.child_name)
+                    logger.info(f"Fall alert sent to {len(teacher_chat_ids)} teachers for {child_data.child_name}")
+                    return web.json_response({"status": "alert_sent", "teachers_notified": len(teacher_chat_ids)})
+                else:
+                    logger.warning(f"No teachers found for child {child_data.child_id}")
+                    return web.json_response({"status": "no_teachers_found"})
+            else:
+                logger.warning(f"Child not found for device_id: {device_id}")
+                return web.json_response({"status": "child_not_found"})
         
-        else:
-            logger.info(f"Received condition '{kondisi}' but only 'terjatuh' is processed")
-            return web.json_response({"status": "condition_ignored", "condition": kondisi})
+        return web.json_response({"status": "condition_ignored", "condition": kondisi, "device_id": device_id})
     
     except Exception as e:
         logger.error(f"❌ Error webhook: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-
 # Health check
 async def health_check(request):
-    global PARENT_CHAT_ID, USER_DATA
+    """Health check endpoint"""
+    active_monitoring = len([k for k, v in MONITORING_DATA.items() if v.monitoring_active])
     
     return web.json_response({
         "status": "healthy",
-        "has_active_parent": PARENT_CHAT_ID is not None,
-        "monitoring_active": USER_DATA.get("monitoring_active", False),
+        "active_monitoring_sessions": active_monitoring,
+        "total_registered_sessions": len(MONITORING_DATA),
         "timestamp": datetime.now().isoformat()
     })
 
-
 async def init_app():
+    # Setup Telegram bot
+    app = Application.builder().token(TOKEN).build()
+    
+    # Handler untuk /register_guru
+    guru_conv = ConversationHandler(
+        entry_points=[CommandHandler("register_guru", register_guru)],
+        states={
+            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, guru_choose)],
+        },
+        fallbacks=[]
+    )
+    app.add_handler(guru_conv)
+
+    # Handler untuk /register_ortu
+    ortu_conv = ConversationHandler(
+        entry_points=[CommandHandler("register_ortu", register_ortu)],
+        states={
+            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, ortu_choose)],
+        },
+        fallbacks=[]
+    )
+    app.add_handler(ortu_conv)
+    """Initialize the application"""
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN tidak ditemukan!")
         return None
     
     if not SCHOOL_COORDS or SCHOOL_COORDS == (0, 0):
-        logger.error("COFFEE_COORDS tidak valid!")
+        logger.error("SCHOOL_COORDS tidak valid!")
         return None
     
     logger.info(f"Initializing bot with token: {TOKEN[:10]}...")
     
-    # Setup Telegram bot
-    app = Application.builder().token(TOKEN).build()
-    
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("children", children_list))
+    app.add_handler(CommandHandler("register_user", register_user))  # Admin only
+    app.add_handler(CommandHandler("register_child", register_child))  # Legacy/admin only
+    app.add_handler(CommandHandler("admin_register", admin_register_child))  # Admin only
+    app.add_handler(CommandHandler("register_as_parent", register_as_parent))  # For parents
+    app.add_handler(CommandHandler("register_as_teacher", register_as_teacher))  # For teachers
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Regex("^(Ya|Tidak|ya|tidak)$"), handle_response))
     
     # Initialize bot
     await app.initialize()
     
-    # Setup web application untuk webhook
+    # Setup web application for webhooks
     web_app = web.Application()
     web_app["bot_app"] = app
     
     # Register routes
     web_app.add_routes([
         web.post("/monitor", handle_antares_webhook),
+        web.post("/monitor/{device_id}", handle_antares_webhook),  # Support device-specific endpoints
         web.get("/health", health_check)
     ])
     
-    logger.info(f"🤖 Bot & Webhook starting on port {WEBHOOK_PORT}")
+    logger.info(f"🤖 Multi-Parent Bot & Webhook starting on port {WEBHOOK_PORT}")
     logger.info(f"📍 School coordinates: {SCHOOL_COORDS}")
     logger.info(f"📏 Monitoring radius: {RADIUS_KM} km")
-    logger.info(f"🚨 Monitoring for 'terjatuh' condition only")
+    logger.info(f"📱 Database: {DATABASE_PATH}")
+    logger.info(f"🚨 Multi-parent system ready")
     
     return app, web_app
 
 def main():
+    """Main function to run the server"""
     async def run_server():
         result = await init_app()
         if result is None:
@@ -401,8 +1075,12 @@ def main():
         site = web.TCPSite(runner, host="0.0.0.0", port=WEBHOOK_PORT)
         await site.start()
         
-        logger.info(f"🚀 Server running on http://0.0.0.0:{WEBHOOK_PORT}")
+        logger.info(f"🚀 Multi-Parent Server running on http://0.0.0.0:{WEBHOOK_PORT}")
         logger.info("✅ Bot and webhook ready! Press Ctrl+C to stop")
+        logger.info("📋 Available endpoints:")
+        logger.info("   POST /monitor - General webhook for IoT data")
+        logger.info("   POST /monitor/{device_id} - Device-specific webhook")
+        logger.info("   GET /health - Health check")
         
         # Keep running both services
         try:
