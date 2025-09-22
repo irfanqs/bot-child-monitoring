@@ -321,11 +321,15 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if len(context.args) != 6:
         await update.message.reply_text(
-            "Format: /register_user nino_id 'nama anak' teacher_id 'nama guru' user_id 'nama ortu'\n\n"
-            "Contoh: /register_user nino_001 'Budi' teacher_1a 'Pak Andi' user1 'Bu Sari'"
+            'Format: /register_user nino_id "nama anak" teacher_id "nama guru" user_id "nama ortu"\n\n'
+            'Contoh: /register_user nino_001 "Budi" teacher_1a "Pak Andi" user1 "Bu Sari"'
         )
         return
     nino_id, nama_anak, teacher_id, nama_guru, user_id, nama_ortu = context.args
+    # Hilangkan underscore pada nama sebelum simpan/tampil
+    nama_anak_bersih = nama_anak.replace('_', ' ')
+    nama_guru_bersih = nama_guru.replace('_', ' ')
+    nama_ortu_bersih = nama_ortu.replace('_', ' ')
     # Validasi kode
     if nino_id not in NINO_CODES:
         await update.message.reply_text(f"Kode alat tidak valid: {nino_id}")
@@ -337,16 +341,16 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Kode ortu tidak valid: {user_id}")
         return
     # Register anak
-    child_ok = db_manager.register_child(nino_id, nama_anak, nino_id)
+    child_ok = db_manager.register_child(nino_id, nama_anak_bersih, nino_id)
     # Register guru (tanpa chat_id, mapping by kode dulu)
-    db_manager.register_parent_child(teacher_id, nino_id, 'teacher')
+    db_manager.register_parent_child(teacher_id, nino_id, 'teacher', nama_guru_bersih)
     # Register ortu (tanpa chat_id, mapping by kode dulu)
-    db_manager.register_parent_child(user_id, nino_id, 'parent')
+    db_manager.register_parent_child(user_id, nino_id, 'parent', nama_ortu_bersih)
     await update.message.reply_text(
         f"✅ Registrasi berhasil!\n\n"
-        f"👶 Anak: {nama_anak} ({nino_id})\n"
-        f"🏫 Guru: {nama_guru} ({teacher_id})\n"
-        f"👨‍👩‍👧‍👦 Ortu: {nama_ortu} ({user_id})"
+        f"👶 Anak: {nama_anak_bersih} ({nino_id})\n"
+        f"🏫 Guru: {nama_guru_bersih} ({teacher_id})\n"
+        f"👨‍👩‍👧‍👦 Ortu: {nama_ortu_bersih} ({user_id})"
     )
 
 # --- Command /register_guru dan /register_ortu untuk registrasi mandiri ---
@@ -990,7 +994,7 @@ async def health_check(request):
 async def init_app():
     # Setup Telegram bot
     app = Application.builder().token(TOKEN).build()
-    
+
     # Handler untuk /register_guru
     guru_conv = ConversationHandler(
         entry_points=[CommandHandler("register_guru", register_guru)],
