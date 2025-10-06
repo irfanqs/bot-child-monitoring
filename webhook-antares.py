@@ -979,6 +979,8 @@ async def handle_antares_webhook(request):
         logger.error(f"❌ Error webhook: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
+
+
 # Health check
 async def health_check(request):
     """Health check endpoint"""
@@ -990,6 +992,34 @@ async def health_check(request):
         "total_registered_sessions": len(MONITORING_DATA),
         "timestamp": datetime.now().isoformat()
     })
+
+async def reset_ortu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    # Hapus mapping parent_child_mapping dan monitoring_sessions untuk parent ini
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM parent_child_mapping WHERE parent_chat_id = ? AND role = 'parent'", (chat_id,))
+        cursor.execute("DELETE FROM monitoring_sessions WHERE parent_chat_id = ?", (chat_id,))
+        conn.commit()
+    # Hapus dari MONITORING_DATA
+    keys_to_remove = [k for k in MONITORING_DATA if k.startswith(f"{chat_id}_")]
+    for k in keys_to_remove:
+        del MONITORING_DATA[k]
+    await update.message.reply_text("✅ Semua data orang tua Anda telah direset.")
+
+async def reset_guru(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    # Hapus mapping parent_child_mapping dan monitoring_sessions untuk guru ini
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM parent_child_mapping WHERE parent_chat_id = ? AND role = 'teacher'", (chat_id,))
+        cursor.execute("DELETE FROM monitoring_sessions WHERE parent_chat_id = ?", (chat_id,))
+        conn.commit()
+    # Hapus dari MONITORING_DATA
+    keys_to_remove = [k for k in MONITORING_DATA if k.startswith(f"{chat_id}_")]
+    for k in keys_to_remove:
+        del MONITORING_DATA[k]
+    await update.message.reply_text("✅ Semua data guru Anda telah direset.")
 
 async def init_app():
     # Setup Telegram bot
@@ -1034,6 +1064,10 @@ async def init_app():
     app.add_handler(CommandHandler("admin_register", admin_register_child))  # Admin only
     app.add_handler(CommandHandler("register_as_parent", register_as_parent))  # For parents
     app.add_handler(CommandHandler("register_as_teacher", register_as_teacher))  # For teachers
+
+    app.add_handler(CommandHandler("reset_ortu", reset_ortu))
+    app.add_handler(CommandHandler("reset_guru", reset_guru))
+
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Regex("^(Ya|Tidak|ya|tidak)$"), handle_response))
     
