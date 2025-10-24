@@ -98,6 +98,16 @@ class DatabaseManager:
                 )
             ''')
             
+            # TAMBAHAN: Tabel untuk mapping kode user ke chat_id
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_code_mapping (
+                    user_code TEXT PRIMARY KEY,
+                    chat_id INTEGER UNIQUE NOT NULL,
+                    role TEXT NOT NULL,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
             conn.commit()
             logger.info("Database initialized successfully")
     
@@ -133,6 +143,30 @@ class DatabaseManager:
             logger.error(f"Failed to register parent-child mapping: {e}")
             return False
     
+    def register_user_code(self, user_code: str, chat_id: int, role: str) -> bool:
+        """Register mapping antara kode user dan chat_id"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO user_code_mapping (user_code, chat_id, role) VALUES (?, ?, ?)",
+                    (user_code, chat_id, role)
+                )
+                conn.commit()
+                logger.info(f"User code {user_code} mapped to chat_id {chat_id} as {role}")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to register user code mapping: {e}")
+            return False
+    
+    def get_chat_id_by_code(self, user_code: str) -> Optional[int]:
+        """Dapatkan chat_id dari kode user"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chat_id FROM user_code_mapping WHERE user_code = ?", (user_code,))
+            result = cursor.fetchone()
+            return result[0] if result else None
+    
     def get_children_by_parent_and_role(self, parent_chat_id: int, role: str) -> List[ChildData]:
         """Get all children for a parent with specific role"""
         with sqlite3.connect(self.db_path) as conn:
@@ -143,24 +177,6 @@ class DatabaseManager:
                 JOIN parent_child_mapping pcm ON c.child_id = pcm.child_id
                 WHERE pcm.parent_chat_id = ? AND pcm.role = ? AND pcm.is_active = 1
             ''', (parent_chat_id, role))
-            
-            results = cursor.fetchall()
-            return [ChildData(
-                child_id=row[0],
-                child_name=row[1], 
-                parent_chat_id=row[2],
-                device_id=row[3],
-                is_active=bool(row[4])
-            ) for row in results]
-        """Get all children for a parent"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT c.child_id, c.child_name, pcm.parent_chat_id, c.device_id, pcm.is_active
-                FROM children c
-                JOIN parent_child_mapping pcm ON c.child_id = pcm.child_id
-                WHERE pcm.parent_chat_id = ? AND pcm.is_active = 1
-            ''', (parent_chat_id,))
             
             results = cursor.fetchall()
             return [ChildData(
@@ -200,17 +216,6 @@ class DatabaseManager:
     def is_admin(self, chat_id: int) -> bool:
         """Check if user is admin"""
         return chat_id in ADMIN_CHAT_IDS
-        """Get all parent chat IDs for a specific child"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT parent_chat_id 
-                FROM parent_child_mapping 
-                WHERE child_id = ? AND is_active = 1
-            ''', (child_id,))
-            
-            results = cursor.fetchall()
-            return [row[0] for row in results]
     
     def get_child_by_device_id(self, device_id: str) -> Optional[ChildData]:
         """Get child data by device ID"""
@@ -227,7 +232,7 @@ class DatabaseManager:
                 return ChildData(
                     child_id=result[0],
                     child_name=result[1],
-                    parent_chat_id=0,  # Will be filled when needed
+                    parent_chat_id=0,
                     device_id=result[2]
                 )
             return None
@@ -264,7 +269,6 @@ class DatabaseManager:
             return False
 
 
-
 # --- Mapping kode ↔ nama (bisa diubah sesuai kebutuhan) ---
 GURU_CODES = {
     "teacher_1a": "Pak Andi", "teacher_1b": "Bu Siti",
@@ -299,9 +303,9 @@ def get_monitoring_key(parent_chat_id: int, child_id: str) -> str:
 # --- Command /register_user khusus admin ---
 async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
+    
     # Cek admin
     if not db_manager.is_admin(chat_id):
-        # Deteksi peran otomatis
         user_role = db_manager.get_user_role(chat_id)
         if user_role == 'teacher':
             await update.message.reply_text(
@@ -319,109 +323,338 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Jika Anda guru, gunakan /register_guru. Jika Anda orang tua, gunakan /register_ortu."
             )
         return
+    
     if len(context.args) != 6:
         await update.message.reply_text(
-            'Format: /register_user nino_id "nama anak" teacher_id "nama guru" user_id "nama ortu"\n\n'
-            'Contoh: /register_user nino_001 "Budi" teacher_1a "Pak Andi" user1 "Bu Sari"'
+            'Format: /register_user nino_id "nama_anak" teacher_id "nama_guru" user_id "nama_ortu"\n\n'
+            'Contoh: /register_user nino_001 "Budi Santoso" teacher_1a "Pak Andi" user1 "Bu Sari"'
         )
         return
+    
     nino_id, nama_anak, teacher_id, nama_guru, user_id, nama_ortu = context.args
-    # Hilangkan underscore pada nama sebelum simpan/tampil
+    
+    # Hilangkan underscore pada nama
     nama_anak_bersih = nama_anak.replace('_', ' ')
     nama_guru_bersih = nama_guru.replace('_', ' ')
     nama_ortu_bersih = nama_ortu.replace('_', ' ')
+    
     # Validasi kode
     if nino_id not in NINO_CODES:
-        await update.message.reply_text(f"Kode alat tidak valid: {nino_id}")
+        await update.message.reply_text(f"❌ Kode alat tidak valid: {nino_id}")
         return
     if teacher_id not in GURU_CODES:
-        await update.message.reply_text(f"Kode guru tidak valid: {teacher_id}")
+        await update.message.reply_text(f"❌ Kode guru tidak valid: {teacher_id}")
         return
     if user_id not in ORTU_CODES:
-        await update.message.reply_text(f"Kode ortu tidak valid: {user_id}")
+        await update.message.reply_text(f"❌ Kode ortu tidak valid: {user_id}")
         return
+    
     # Register anak
     child_ok = db_manager.register_child(nino_id, nama_anak_bersih, nino_id)
-    # Register guru (tanpa chat_id, mapping by kode dulu)
-    db_manager.register_parent_child(teacher_id, nino_id, 'teacher', nama_guru_bersih)
-    # Register ortu (tanpa chat_id, mapping by kode dulu)
-    db_manager.register_parent_child(user_id, nino_id, 'parent', nama_ortu_bersih)
+    
+    # Register guru - gunakan KODE sebagai parent_chat_id (untuk kompatibilitas)
+    # Nantinya akan di-resolve ke real chat_id saat user menjalankan /start
+    guru_ok = db_manager.register_parent_child(teacher_id, nino_id, 'teacher', nama_guru_bersih)
+    
+    # Register ortu - gunakan KODE sebagai parent_chat_id
+    ortu_ok = db_manager.register_parent_child(user_id, nino_id, 'parent', nama_ortu_bersih)
+    
+    status = []
+    if child_ok:
+        status.append("✅ Anak terdaftar")
+    else:
+        status.append("⚠️ Anak sudah ada (update data)")
+    
+    if guru_ok:
+        status.append("✅ Guru di-assign")
+    else:
+        status.append("⚠️ Guru sudah di-assign")
+    
+    if ortu_ok:
+        status.append("✅ Ortu di-assign")
+    else:
+        status.append("⚠️ Ortu sudah di-assign")
+    
+    # PERBAIKAN: Indentasi diperbaiki dan backslash di-handle dengan benar
+    status_text = "\n".join(status)  # Buat variable terpisah, jangan langsung di f-string
+    
     await update.message.reply_text(
-        f"✅ Registrasi berhasil!\n\n"
+        f"📋 **Hasil Registrasi:**\n\n"
         f"👶 Anak: {nama_anak_bersih} ({nino_id})\n"
         f"🏫 Guru: {nama_guru_bersih} ({teacher_id})\n"
-        f"👨‍👩‍👧‍👦 Ortu: {nama_ortu_bersih} ({user_id})"
+        f"👨‍👩‍👧‍👦 Ortu: {nama_ortu_bersih} ({user_id})\n\n"
+        f"{status_text}\n\n"
+        f"ℹ️ Guru dan orang tua perlu menjalankan /start untuk aktivasi.",
+        parse_mode='Markdown'
     )
 
 # --- Command /register_guru dan /register_ortu untuk registrasi mandiri ---
-GURU_CHOOSE, GURU_CONFIRM = range(2)
-ORTU_CHOOSE, ORTU_CONFIRM = range(2)
+# --- Conversation states - PISAHKAN UNTUK SETIAP HANDLER ---
+GURU_CHOOSE = 100
+ORTU_CHOOSE = 200
+
+# --- Mapping kode ↔ nama (bisa diubah sesuai kebutuhan) ---
+GURU_CODES = {
+    "teacher_1a": "Latifatuz Zuhriyah, S.Pd (1A)",
+    "teacher_2a": "Ella Firliani, S.Ag (2A)",
+    "teacher_3a": "Ayunda Umirotus Sakinah, S.Pd (3A)",
+    "teacher_4a": "Ana Maulidia Ningrum, S.Pd (4A)",
+    "teacher_5a": "Arif Nur Hidayat, S.Pd (5A)",
+    "teacher_6a": "Nia Mufida, S.E (6A)"
+}
+
+ORTU_CODES = {
+    "user1": "Iin Indarti",
+    "user2": "Yeni Isfatul Achmad",
+    "user3": "Lu'luil Maknun",
+    "user4": "Fitri Wahyuningsih",
+    "user5": "Siti Maisaroh",
+    "user6": "Thoriqul Mukhoffifah",
+    "user7": "Vela Sindy Oktavianti"
+}
+
+NINO_CODES = {
+    f"nino_{str(k).zfill(3)}": f"Anak {k}" for k in range(1, 16)
+}
+
+# Helper untuk dapatkan nama dari kode
+def get_guru_name(kode):
+    return GURU_CODES.get(kode, kode)
+def get_ortu_name(kode):
+    return ORTU_CODES.get(kode, kode)
+def get_nino_name(kode):
+    return NINO_CODES.get(kode, kode)
+
+# Inisialisasi database manager
+db_manager = DatabaseManager(DATABASE_PATH)
+MONITORING_DATA: Dict[str, ParentMonitoringData] = {}
 
 async def register_guru(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point untuk registrasi guru - Step 1: Pilih kode"""
+    chat_id = update.message.chat_id
+    
+    # Cek apakah sudah terdaftar
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_code FROM user_code_mapping WHERE chat_id = ? AND role = 'teacher'", (chat_id,))
+        existing = cursor.fetchone()
+    
+    if existing:
+        await update.message.reply_text(
+            f"ℹ️ Anda sudah terdaftar sebagai guru dengan kode: **{existing[0]}**\n\n"
+            f"Nama: {GURU_CODES.get(existing[0], 'Unknown')}\n\n"
+            f"Ketik /start untuk aktivasi atau /reset_guru untuk reset.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    
     # Tampilkan list kode guru
-    text = "Pilih kode guru Anda (balas dengan angka 1-12):\n"
+    text = "🏫 **REGISTRASI GURU**\n\n"
+    text += "Pilih nama Anda (balas dengan angka):\n\n"
+    
     for idx, (kode, nama) in enumerate(GURU_CODES.items(), 1):
-        text += f"{idx}. {nama} ({kode})\n"
-    await update.message.reply_text(text)
+        text += f"{idx}. {nama}\n"
+    
+    text += "\n💡 *Balas dengan angka 1-6*"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+    
+    # Simpan list kode ke context
     context.user_data['guru_kode_list'] = list(GURU_CODES.keys())
+    
     return GURU_CHOOSE
 
 async def guru_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk pilihan kode guru - Step 2: Proses pilihan"""
     try:
         idx = int(update.message.text.strip()) - 1
-        kode = context.user_data['guru_kode_list'][idx]
+        kode_list = context.user_data.get('guru_kode_list', [])
+        
+        if idx < 0 or idx >= len(kode_list):
+            raise IndexError
+        
+        kode = kode_list[idx]
     except (ValueError, IndexError):
-        await update.message.reply_text("Input tidak valid. Balas dengan angka 1-12.")
+        await update.message.reply_text(
+            "❌ Input tidak valid. Balas dengan angka 1-6.\n\n"
+            "Atau ketik /register_guru untuk mulai lagi."
+        )
         return GURU_CHOOSE
+    
     chat_id = update.message.chat_id
-    # Mapping chat_id ke kode guru
-    db_manager.register_parent_child(chat_id, None, 'teacher')  # None untuk child_id, hanya mapping role
-    context.user_data['guru_kode'] = kode
-    await update.message.reply_text(f"Anda terdaftar sebagai {GURU_CODES[kode]} ({kode})")
-    # Tampilkan anak yang terdaftar dengan guru ini (dummy, bisa diupdate sesuai DB)
-    anak_list = []
+    
+    # Cek apakah kode sudah digunakan guru lain
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT child_id, child_name FROM parent_child_mapping pcm JOIN children c ON pcm.child_id = c.child_id WHERE pcm.parent_chat_id = ? AND pcm.role = 'teacher'", (kode,))
-        anak_list = cursor.fetchall()
-    if anak_list:
-        msg = "Daftar anak yang diampu:\n" + "\n".join([f"- {nama} ({cid})" for cid, nama in anak_list])
-    else:
-        msg = "Belum ada anak yang terdaftar di bawah Anda."
-    await update.message.reply_text(msg)
+        cursor.execute("SELECT chat_id FROM user_code_mapping WHERE user_code = ? AND role = 'teacher'", (kode,))
+        existing = cursor.fetchone()
+    
+    if existing and existing[0] != chat_id:
+        await update.message.reply_text(
+            f"❌ Kode **{kode}** sudah digunakan oleh guru lain.\n\n"
+            f"Silakan pilih kode yang berbeda atau hubungi admin.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    
+    # SIMPAN MAPPING KODE → CHAT_ID
+    if not db_manager.register_user_code(kode, chat_id, 'teacher'):
+        await update.message.reply_text(
+            "❌ Terjadi error saat menyimpan data.\n"
+            "Silakan coba lagi atau hubungi admin."
+        )
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        f"✅ **Registrasi Berhasil!**\n\n"
+        f"👨‍🏫 Nama: **{GURU_CODES[kode]}**\n"
+        f"🔑 Kode: `{kode}`\n"
+        f"💬 Chat ID: `{chat_id}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📝 **Langkah Selanjutnya:**\n\n"
+        f"1️⃣ Tunggu admin meng-assign murid ke Anda\n"
+        f"2️⃣ Setelah di-assign, ketik /start untuk aktivasi\n"
+        f"3️⃣ Anda akan menerima alert jika murid terjatuh\n\n"
+        f"💡 Format untuk admin:\n"
+        f"`/register_user [nino_id] [nama_anak] {kode} [nama_guru] [user_id] [nama_ortu]`",
+        parse_mode='Markdown'
+    )
+    
+    # Cek apakah sudah ada murid yang di-assign (dari registrasi sebelumnya oleh admin)
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT c.child_id, c.child_name 
+                FROM parent_child_mapping pcm 
+                JOIN children c ON pcm.child_id = c.child_id 
+                WHERE pcm.parent_chat_id = ? AND pcm.role = 'teacher'
+            """, (kode,))
+            murid_list = cursor.fetchall()
+        
+        if murid_list:
+            msg = "\n📚 **Murid yang sudah di-assign:**\n\n"
+            for cid, nama in murid_list:
+                msg += f"  • {nama} ({cid})\n"
+            msg += f"\n✨ Ketik /start untuk aktivasi alert!"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error checking assigned children: {e}")
+    
     return ConversationHandler.END
 
 async def register_ortu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Tampilkan list kode ortu
-    text = "Pilih kode orang tua Anda (balas dengan angka 1-15):\n"
+    """Entry point untuk registrasi orang tua - Step 1: Pilih kode"""
+    chat_id = update.message.chat_id
+    
+    # Cek apakah sudah terdaftar
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_code FROM user_code_mapping WHERE chat_id = ? AND role = 'parent'", (chat_id,))
+        existing = cursor.fetchone()
+    
+    if existing:
+        await update.message.reply_text(
+            f"ℹ️ Anda sudah terdaftar sebagai orang tua dengan kode: **{existing[0]}**\n\n"
+            f"Nama: {ORTU_CODES.get(existing[0], 'Unknown')}\n\n"
+            f"Ketik /start untuk aktivasi atau /reset_ortu untuk reset.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    
+    # Tampilkan list kode orang tua
+    text = "👨‍👩‍👧‍👦 **REGISTRASI ORANG TUA**\n\n"
+    text += "Pilih nama Anda (balas dengan angka):\n\n"
+    
     for idx, (kode, nama) in enumerate(ORTU_CODES.items(), 1):
-        text += f"{idx}. {nama} ({kode})\n"
-    await update.message.reply_text(text)
+        text += f"{idx}. {nama}\n"
+    
+    text += "\n💡 *Balas dengan angka 1-7*"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+    
+    # Simpan list kode ke context
     context.user_data['ortu_kode_list'] = list(ORTU_CODES.keys())
+    
     return ORTU_CHOOSE
 
 async def ortu_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk pilihan kode orang tua - Step 2: Proses pilihan"""
     try:
         idx = int(update.message.text.strip()) - 1
-        kode = context.user_data['ortu_kode_list'][idx]
+        kode_list = context.user_data.get('ortu_kode_list', [])
+        
+        if idx < 0 or idx >= len(kode_list):
+            raise IndexError
+        
+        kode = kode_list[idx]
     except (ValueError, IndexError):
-        await update.message.reply_text("Input tidak valid. Balas dengan angka 1-15.")
+        await update.message.reply_text(
+            "❌ Input tidak valid. Balas dengan angka 1-7.\n\n"
+            "Atau ketik /register_ortu untuk mulai lagi."
+        )
         return ORTU_CHOOSE
+    
     chat_id = update.message.chat_id
-    db_manager.register_parent_child(chat_id, None, 'parent')  # None untuk child_id, hanya mapping role
-    context.user_data['ortu_kode'] = kode
-    await update.message.reply_text(f"Anda terdaftar sebagai {ORTU_CODES[kode]} ({kode})")
-    # Tampilkan anak yang terdaftar dengan ortu ini (dummy, bisa diupdate sesuai DB)
-    anak_list = []
+    
+    # Cek apakah kode sudah digunakan orang tua lain
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT child_id, child_name FROM parent_child_mapping pcm JOIN children c ON pcm.child_id = c.child_id WHERE pcm.parent_chat_id = ? AND pcm.role = 'parent'", (kode,))
-        anak_list = cursor.fetchall()
-    if anak_list:
-        msg = "Daftar anak Anda:\n" + "\n".join([f"- {nama} ({cid})" for cid, nama in anak_list])
-    else:
-        msg = "Belum ada anak yang terdaftar di bawah Anda."
-    await update.message.reply_text(msg)
+        cursor.execute("SELECT chat_id FROM user_code_mapping WHERE user_code = ? AND role = 'parent'", (kode,))
+        existing = cursor.fetchone()
+    
+    if existing and existing[0] != chat_id:
+        await update.message.reply_text(
+            f"❌ Kode **{kode}** sudah digunakan oleh orang tua lain.\n\n"
+            f"Silakan pilih kode yang berbeda atau hubungi admin.",
+            parse_mode='Markdown'
+        )
+        return ConversationHandler.END
+    
+    # SIMPAN MAPPING KODE → CHAT_ID
+    if not db_manager.register_user_code(kode, chat_id, 'parent'):
+        await update.message.reply_text(
+            "❌ Terjadi error saat menyimpan data.\n"
+            "Silakan coba lagi atau hubungi admin."
+        )
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        f"✅ **Registrasi Berhasil!**\n\n"
+        f"👨‍👩‍👧‍👦 Nama: **{ORTU_CODES[kode]}**\n"
+        f"🔑 Kode: `{kode}`\n"
+        f"💬 Chat ID: `{chat_id}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📝 **Langkah Selanjutnya:**\n\n"
+        f"1️⃣ Tunggu admin meng-assign anak ke Anda\n"
+        f"2️⃣ Setelah di-assign, ketik /start untuk aktivasi\n"
+        f"3️⃣ Share lokasi saat menjemput anak\n\n"
+        f"💡 Format untuk admin:\n"
+        f"`/register_user [nino_id] [nama_anak] [teacher_id] [nama_guru] {kode} [nama_ortu]`",
+        parse_mode='Markdown'
+    )
+    
+    # Cek apakah sudah ada anak yang di-assign (dari registrasi sebelumnya oleh admin)
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT c.child_id, c.child_name 
+                FROM parent_child_mapping pcm 
+                JOIN children c ON pcm.child_id = c.child_id 
+                WHERE pcm.parent_chat_id = ? AND pcm.role = 'parent'
+            """, (kode,))
+            anak_list = cursor.fetchall()
+        
+        if anak_list:
+            msg = "\n👶 **Anak yang sudah di-assign:**\n\n"
+            for cid, nama in anak_list:
+                msg += f"  • {nama} ({cid})\n"
+            msg += f"\n✨ Ketik /start untuk aktivasi monitoring!"
+            await update.message.reply_text(msg, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Error checking assigned children: {e}")
+    
     return ConversationHandler.END
 
 class TelegramMessageSender:
@@ -535,22 +768,59 @@ class TelegramMessageSender:
 
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command - different behavior for parent vs teacher"""
+    """Start command - resolve user code to chat_id and activate monitoring"""
     chat_id = update.message.chat_id
+    
+    # PESAN WELCOME/PENDAHULUAN
+    welcome_message = (
+        "🤖 **Selamat datang di Nino - Child Monitoring Bot!**\n\n"
+        "Silahkan jalankan command berikut untuk register:\n\n"
+        "👉 /register_guru untuk guru\n" 
+        "👉 /register_ortu untuk orang tua\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    
+    # Cek apakah user sudah punya mapping kode
+    user_code = None
+    user_role_from_mapping = None
+    
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_code, role FROM user_code_mapping WHERE chat_id = ?", (chat_id,))
+        result = cursor.fetchone()
+        
+        if result:
+            user_code, user_role_from_mapping = result
+            
+            # UPDATE parent_chat_id dari kode ke real chat_id (RESOLVE)
+            cursor.execute("""
+                UPDATE parent_child_mapping 
+                SET parent_chat_id = ? 
+                WHERE parent_chat_id = ? AND role = ?
+            """, (chat_id, user_code, user_role_from_mapping))
+            conn.commit()
+            
+            logger.info(f"✅ Resolved {user_code} → chat_id {chat_id} for role {user_role_from_mapping}")
+    
+    # Dapatkan role user dari database
     user_role = db_manager.get_user_role(chat_id)
     
+    # Cek status registrasi dan assignment
     if user_role == 'parent':
-        # Parent logic - location monitoring
         children = db_manager.get_children_by_parent_and_role(chat_id, 'parent')
         
         if not children:
-            await update.message.reply_text(
-                "❌ Anda belum terdaftar sebagai orangtua.\n\n"
-                "📞 Hubungi admin untuk registrasi anak Anda."
+            # Sudah register tapi belum di-assign
+            status_message = (
+                f"📊 **Status saat ini:**\n"
+                f"✅ Terdaftar sebagai: **Orang Tua** ({user_code if user_code else 'Unknown'})\n"
+                f"❌ Belum di-assign ke anak manapun\n\n"
+                f"📞 Hubungi admin untuk assignment anak."
             )
+            await update.message.reply_text(welcome_message + status_message, parse_mode='Markdown')
             return
         
-        # Start monitoring for all children
+        # Sudah register dan sudah di-assign - AKTIVASI MONITORING
         for child in children:
             monitoring_key = get_monitoring_key(chat_id, child.child_id)
             MONITORING_DATA[monitoring_key] = ParentMonitoringData(
@@ -563,82 +833,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         child_names = ", ".join([child.child_name for child in children])
         
-        tutorial = (
-            f"👨‍👩‍👧‍👦 **Mode Orangtua Aktif**\n"
-            f"Monitoring untuk: **{child_names}**\n\n"
-            "📍 **Untuk menjemput anak:**\n"
-            "1. Bagikan Live Location saat menuju sekolah\n"
-            "2. Bot akan memberi tahu ketika Anda dekat sekolah\n"
-            "3. Bot akan tanya apakah anak sudah dijemput\n\n"
-            "📋 Ketik /status untuk cek status monitoring"
+        status_message = (
+            f"📊 **Status saat ini:**\n"
+            f"✅ Terdaftar sebagai: **{ORTU_CODES.get(user_code, 'Orang Tua')}**\n"
+            f"✅ Monitoring aktif untuk: **{child_names}**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📍 **Untuk menjemput anak:**\n"
+            f"1. Bagikan Live Location saat menuju sekolah\n"
+            f"2. Bot akan memberi tahu ketika Anda dekat sekolah\n"
+            f"3. Bot akan tanya apakah anak sudah dijemput\n\n"
+            f"📋 Ketik /status untuk cek status monitoring"
         )
         
-        await update.message.reply_text(tutorial, parse_mode='Markdown')
-        logger.info(f"Parent monitoring started for {chat_id} with {len(children)} children")
-    
+        await update.message.reply_text(welcome_message + status_message, parse_mode='Markdown')
+        logger.info(f"✅ Parent monitoring started for {chat_id} ({user_code}) with {len(children)} children")
+        
     elif user_role == 'teacher':
-        # Teacher logic - only receive fall alerts
         children = db_manager.get_children_by_parent_and_role(chat_id, 'teacher')
         
         if not children:
-            await update.message.reply_text(
-                "❌ Anda belum terdaftar sebagai guru.\n\n" 
-                "📞 Hubungi admin untuk registrasi."
+            # Sudah register tapi belum di-assign
+            status_message = (
+                f"📊 **Status saat ini:**\n"
+                f"✅ Terdaftar sebagai: **Guru** ({user_code if user_code else 'Unknown'})\n"
+                f"❌ Belum di-assign ke murid manapun\n\n"
+                f"📞 Hubungi admin untuk assignment murid."
             )
+            await update.message.reply_text(welcome_message + status_message, parse_mode='Markdown')
             return
         
+        # Sudah register dan sudah di-assign - AKTIVASI MODE ALERT
         child_names = ", ".join([child.child_name for child in children])
         
-        message = (
-            f"🏫 **Mode Guru Aktif**\n"
-            f"Monitoring untuk: **{child_names}**\n\n"
-            "🚨 Anda akan menerima alert jika ada anak yang terjatuh\n"
-            "📱 Alert akan dikirim otomatis dari sistem IoT\n\n"
-            "ℹ️ Mode guru hanya menerima alert, tidak ada fitur lain."
+        status_message = (
+            f"📊 **Status saat ini:**\n"
+            f"✅ Terdaftar sebagai: **{GURU_CODES.get(user_code, 'Guru')}**\n"
+            f"✅ Mode alert aktif untuk: **{child_names}**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🚨 Anda akan menerima alert jika ada murid yang terjatuh\n"
+            f"📱 Alert akan dikirim otomatis dari sistem IoT\n\n"
+            f"ℹ️ Mode guru hanya menerima alert, tidak ada fitur lain.\n"
+            f"📋 Ketik /status untuk cek murid yang di-assign"
         )
         
-        await update.message.reply_text(message, parse_mode='Markdown')
-        logger.info(f"Teacher alert mode activated for {chat_id} with {len(children)} children")
+        await update.message.reply_text(welcome_message + status_message, parse_mode='Markdown')
+        logger.info(f"✅ Teacher alert mode activated for {chat_id} ({user_code}) with {len(children)} children")
     
     else:
-        # Unknown user
-        await update.message.reply_text(
-            "❌ Anda belum terdaftar dalam sistem.\n\n"
-            "📞 Hubungi admin untuk registrasi sebagai orangtua atau guru."
+        # Belum terdaftar sama sekali
+        status_message = (
+            f"📊 **Status saat ini:**\n"
+            f"❌ Anda tidak terdaftar sebagai guru atau orang tua\n\n"
+            f"💡 Silakan pilih peran Anda dan lakukan registrasi terlebih dahulu."
         )
-
-async def register_as_parent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Register current user as parent for a child - used by parents"""
-    chat_id = update.message.chat_id
-    
-    if len(context.args) != 3:
-        await update.message.reply_text(
-            "Format: `/register_as_parent [child_id] [nama_anak] [device_id]`\n\n"
-            "Contoh: `/register_as_parent ANAK001 \"Budi Santoso\" DEV001`\n\n"
-            "ℹ️ Command ini untuk orangtua mendaftarkan diri untuk anak mereka."
-        )
-        return
-    
-    child_id, child_name, device_id = context.args
-    phone = update.message.from_user.phone_number if update.message.from_user else None
-    
-    # Register child if not exists
-    if not db_manager.register_child(child_id, child_name, device_id):
-        # Child might already exist, that's ok
-        pass
-    
-    # Register as parent
-    if db_manager.register_parent_child(chat_id, child_id, 'parent', phone):
-        await update.message.reply_text(
-            f"✅ **Registrasi Berhasil!**\n\n"
-            f"👶 Anak: {child_name} ({child_id})\n"
-            f"📱 Device: {device_id}\n"
-            f"👨‍👩‍👧‍👦 Role: Orangtua\n\n"
-            f"🚀 Ketik /start untuk mulai monitoring!"
-        )
-        logger.info(f"Parent {chat_id} registered for child {child_id}")
-    else:
-        await update.message.reply_text("❌ Registrasi gagal. Mungkin Anda sudah terdaftar untuk anak ini.")
+        await update.message.reply_text(welcome_message + status_message, parse_mode='Markdown')
 
 async def register_as_teacher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Register current user as teacher for a child - used by teachers"""
@@ -1022,28 +1270,6 @@ async def reset_guru(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Semua data guru Anda telah direset.")
 
 async def init_app():
-    # Setup Telegram bot
-    app = Application.builder().token(TOKEN).build()
-
-    # Handler untuk /register_guru
-    guru_conv = ConversationHandler(
-        entry_points=[CommandHandler("register_guru", register_guru)],
-        states={
-            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, guru_choose)],
-        },
-        fallbacks=[]
-    )
-    app.add_handler(guru_conv)
-
-    # Handler untuk /register_ortu
-    ortu_conv = ConversationHandler(
-        entry_points=[CommandHandler("register_ortu", register_ortu)],
-        states={
-            0: [MessageHandler(filters.TEXT & ~filters.COMMAND, ortu_choose)],
-        },
-        fallbacks=[]
-    )
-    app.add_handler(ortu_conv)
     """Initialize the application"""
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN tidak ditemukan!")
@@ -1055,41 +1281,65 @@ async def init_app():
     
     logger.info(f"Initializing bot with token: {TOKEN[:10]}...")
     
-    # Add handlers
+    # Setup bot dengan timeout yang lebih besar
+    app = Application.builder()\
+        .token(TOKEN)\
+        .read_timeout(30)\
+        .write_timeout(30)\
+        .connect_timeout(30)\
+        .pool_timeout(30)\
+        .build()
+    
+    # ConversationHandler untuk /register_guru
+    guru_conv = ConversationHandler(
+        entry_points=[CommandHandler("register_guru", register_guru)],
+        states={
+            GURU_CHOOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, guru_choose)],
+        },
+        fallbacks=[],
+        name="guru_registration",
+        persistent=False
+    )
+    app.add_handler(guru_conv)
+
+    # ConversationHandler untuk /register_ortu
+    ortu_conv = ConversationHandler(
+        entry_points=[CommandHandler("register_ortu", register_ortu)],
+        states={
+            ORTU_CHOOSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ortu_choose)],
+        },
+        fallbacks=[],
+        name="ortu_registration",
+        persistent=False
+    )
+    app.add_handler(ortu_conv)
+    
+    # Add other handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("children", children_list))
-    app.add_handler(CommandHandler("register_user", register_user))  # Admin only
-    app.add_handler(CommandHandler("register_child", register_child))  # Legacy/admin only
-    app.add_handler(CommandHandler("admin_register", admin_register_child))  # Admin only
-    app.add_handler(CommandHandler("register_as_parent", register_as_parent))  # For parents
-    app.add_handler(CommandHandler("register_as_teacher", register_as_teacher))  # For teachers
-
+    app.add_handler(CommandHandler("register_user", register_user))
     app.add_handler(CommandHandler("reset_ortu", reset_ortu))
     app.add_handler(CommandHandler("reset_guru", reset_guru))
-
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Regex("^(Ya|Tidak|ya|tidak)$"), handle_response))
     
     # Initialize bot
     await app.initialize()
     
-    # Setup web application for webhooks
+    # Setup web application
     web_app = web.Application()
     web_app["bot_app"] = app
     
-    # Register routes
     web_app.add_routes([
         web.post("/monitor", handle_antares_webhook),
-        web.post("/monitor/{device_id}", handle_antares_webhook),  # Support device-specific endpoints
+        web.post("/monitor/{device_id}", handle_antares_webhook),
         web.get("/health", health_check)
     ])
     
-    logger.info(f"🤖 Multi-Parent Bot & Webhook starting on port {WEBHOOK_PORT}")
-    logger.info(f"📍 School coordinates: {SCHOOL_COORDS}")
-    logger.info(f"📏 Monitoring radius: {RADIUS_KM} km")
-    logger.info(f"📱 Database: {DATABASE_PATH}")
-    logger.info(f"🚨 Multi-parent system ready")
+    logger.info(f"🤖 Bot ready on port {WEBHOOK_PORT}")
+    logger.info(f"👨‍🏫 Guru: {len(GURU_CODES)} kode tersedia")
+    logger.info(f"👨‍👩‍👧‍👦 Orang Tua: {len(ORTU_CODES)} kode tersedia")
     
     return app, web_app
 
