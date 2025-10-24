@@ -352,42 +352,32 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Register anak
     child_ok = db_manager.register_child(nino_id, nama_anak_bersih, nino_id)
     
-    # Register guru - gunakan KODE sebagai parent_chat_id (untuk kompatibilitas)
-    # Nantinya akan di-resolve ke real chat_id saat user menjalankan /start
-    guru_ok = db_manager.register_parent_child(teacher_id, nino_id, 'teacher', nama_guru_bersih)
+    # PERBAIKAN: Cek apakah guru/ortu sudah register dan dapatkan chat_id mereka
+    teacher_chat_id = db_manager.get_chat_id_by_code(teacher_id)
+    parent_chat_id = db_manager.get_chat_id_by_code(user_id)
     
-    # Register ortu - gunakan KODE sebagai parent_chat_id
-    ortu_ok = db_manager.register_parent_child(user_id, nino_id, 'parent', nama_ortu_bersih)
+    guru_ok = False
+    ortu_ok = False
     
-    status = []
-    if child_ok:
-        status.append("✅ Anak terdaftar")
+    # Register guru
+    if teacher_chat_id:
+        # Guru sudah register, gunakan chat_id asli
+        guru_ok = db_manager.register_parent_child(teacher_chat_id, nino_id, 'teacher', nama_guru_bersih)
     else:
-        status.append("⚠️ Anak sudah ada (update data)")
+        # Guru belum register, simpan dengan placeholder negative number
+        # Format: -hash(teacher_id) untuk memastikan unique dan negative
+        placeholder_id = -abs(hash(teacher_id)) % (10 ** 8)
+        guru_ok = db_manager.register_parent_child(placeholder_id, nino_id, 'teacher', nama_guru_bersih)
     
-    if guru_ok:
-        status.append("✅ Guru di-assign")
+    # Register ortu
+    if parent_chat_id:
+        # Ortu sudah register, gunakan chat_id asli
+        ortu_ok = db_manager.register_parent_child(parent_chat_id, nino_id, 'parent', nama_ortu_bersih)
     else:
-        status.append("⚠️ Guru sudah di-assign")
-    
-    if ortu_ok:
-        status.append("✅ Ortu di-assign")
-    else:
-        status.append("⚠️ Ortu sudah di-assign")
-    
-    # PERBAIKAN: Indentasi diperbaiki dan backslash di-handle dengan benar
-    status_text = "\n".join(status)  # Buat variable terpisah, jangan langsung di f-string
-    
-    await update.message.reply_text(
-        f"📋 **Hasil Registrasi:**\n\n"
-        f"👶 Anak: {nama_anak_bersih} ({nino_id})\n"
-        f"🏫 Guru: {nama_guru_bersih} ({teacher_id})\n"
-        f"👨‍👩‍👧‍👦 Ortu: {nama_ortu_bersih} ({user_id})\n\n"
-        f"{status_text}\n\n"
-        f"ℹ️ Guru dan orang tua perlu menjalankan /start untuk aktivasi.",
-        parse_mode='Markdown'
-    )
-
+        # Ortu belum register, simpan dengan placeholder negative number
+        placeholder_id = -abs(hash(user_id)) % (10 ** 8)
+        ortu_ok = db_manager.register_parent_child(placeholder_id, nino_id, 'parent', nama_ortu_bersih)
+        
 # --- Command /register_guru dan /register_ortu untuk registrasi mandiri ---
 # --- Conversation states - PISAHKAN UNTUK SETIAP HANDLER ---
 GURU_CHOOSE = 100
